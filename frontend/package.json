@@ -15,7 +15,7 @@
     "@aws-amplify/core": "6.19.3",
     "@fontsource/inter": "5.2.5",
     "lucide-react": "0.475.0",
-    "react": "18.3.1",
+    "react": "19.3.1",
     "react-dom": "18.3.1",
     "react-router-dom": "7.18.4"
   },
@@ -24,7 +24,7 @@
     "@testing-library/react": "16.3.0",
     "@testing-library/user-event": "14.6.1",
     "@types/node": "22.15.21",
-    "@types/react": "18.3.31",
+    "@types/react": "19.3.0",
     "@types/react-dom": "18.3.7",
     "@vitejs/plugin-react": "4.7.0",
     "autoprefixer": "10.6.1",
