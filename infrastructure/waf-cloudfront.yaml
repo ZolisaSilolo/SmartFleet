@@ -1,0 +1,143 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: SmartFleet CloudFront WAF web ACL. CLOUDFRONT-scope WAF resources
+  MUST be created in us-east-1 (an AWS requirement for global edge resources);
+  every other SmartFleet resource lives in the project Region. Deploy this stack
+  first, then pass its WebAclArn output to the main stack as the WebAclArn
+  parameter.
+Metadata:
+  AWSToolsMetrics:
+    AWSAgentToolkit: aws-cloudformation@3
+
+Parameters:
+  Stage:
+    Type: String
+    AllowedValues:
+      - dev
+      - staging
+      - prod
+  GeneralRateLimit:
+    Type: Number
+    Default: 2000
+    Description: Max requests per source IP per 5 minutes across the whole site.
+  ApiRateLimit:
+    Type: Number
+    Default: 600
+    Description: Max /api requests per source IP per 5 minutes.
+  LogRetentionDays:
+    Type: Number
+    Default: 90
+    AllowedValues:
+      - 30
+      - 60
+      - 90
+      - 120
+      - 180
+      - 365
+
+Resources:
+  WafLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      LogGroupName: !Sub aws-waf-logs-smartfleet-${Stage}
+      RetentionInDays: !Ref LogRetentionDays
+
+  WebAcl:
+    Type: AWS::WAFv2::WebACL
+    Properties:
+      Name: !Sub smartfleet-${Stage}
+      Scope: CLOUDFRONT
+      DefaultAction:
+        Allow: {}
+      VisibilityConfig:
+        SampledRequestsEnabled: true
+        CloudWatchMetricsEnabled: true
+        MetricName: !Sub smartfleet-${Stage}
+      Rules:
+        - Name: IpReputation
+          Priority: 0
+          OverrideAction:
+            None: {}
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesAmazonIpReputationList
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: IpReputation
+        - Name: CommonRules
+          Priority: 1
+          OverrideAction:
+            None: {}
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesCommonRuleSet
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: CommonRules
+        - Name: KnownBadInputs
+          Priority: 2
+          OverrideAction:
+            None: {}
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesKnownBadInputsRuleSet
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: KnownBadInputs
+        - Name: ApiRateLimitPerIp
+          Priority: 3
+          Action:
+            Block: {}
+          Statement:
+            RateBasedStatement:
+              Limit: !Ref ApiRateLimit
+              AggregateKeyType: IP
+              ScopeDownStatement:
+                ByteMatchStatement:
+                  SearchString: /api/
+                  FieldToMatch:
+                    UriPath: {}
+                  PositionalConstraint: STARTS_WITH
+                  TextTransformations:
+                    - Priority: 0
+                      Type: NONE
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: ApiRateLimitPerIp
+        - Name: GeneralRateLimitPerIp
+          Priority: 4
+          Action:
+            Block: {}
+          Statement:
+            RateBasedStatement:
+              Limit: !Ref GeneralRateLimit
+              AggregateKeyType: IP
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: GeneralRateLimitPerIp
+
+  WafLogging:
+    Type: AWS::WAFv2::LoggingConfiguration
+    Properties:
+      ResourceArn: !GetAtt WebAcl.Arn
+      LogDestinationConfigs:
+        - !GetAtt WafLogGroup.Arn
+      RedactedFields:
+        - SingleHeader:
+            Name: authorization
+        - SingleHeader:
+            Name: cookie
+
+Outputs:
+  WebAclArn:
+    Description: Pass to the main stack parameter WebAclArn.
+    Value: !GetAtt WebAcl.Arn

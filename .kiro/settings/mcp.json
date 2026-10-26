@@ -1,0 +1,52 @@
+{
+  "mcpServers": {
+    "well-architected-security-mcp-server": {
+      "command": "uv",
+      "args": ["tool", "run", "--from", "awslabs.well-architected-security-mcp-server@latest", "awslabs.well-architected-security-mcp-server.exe"],
+      "env": {"FASTMCP_LOG_LEVEL": "ERROR", "AWS_REGION": "af-south-1"},
+      "timeout": 120,
+      "type": "stdio",
+      "disabled": false
+    },
+    "aws-serverless-mcp-server": {
+      "command": "uv",
+      "args": ["tool", "run", "--from", "awslabs.aws-serverless-mcp-server@latest", "awslabs.aws-serverless-mcp-server.exe"],
+      "env": {"FASTMCP_LOG_LEVEL": "ERROR", "AWS_REGION": "af-south-1"},
+      "timeout": 120,
+      "type": "stdio",
+      "disabled": false
+    },
+    "awslabs.aws-iac-mcp-server": {
+      "command": "uvx",
+      "args": ["awslabs.aws-iac-mcp-server@latest"],
+      "env": {"AWS_REGION": "af-south-1", "FASTMCP_LOG_LEVEL": "ERROR"},
+      "timeout": 120,
+      "type": "stdio",
+      "disabled": false
+    },
+    "awslabs.iam-mcp-server": {
+      "command": "uv",
+      "args": ["tool", "run", "--from", "awslabs.iam-mcp-server@latest", "awslabs.iam-mcp-server.exe", "--readonly"],
+      "env": {"FASTMCP_LOG_LEVEL": "ERROR", "AWS_REGION": "af-south-1"},
+      "timeout": 60,
+      "type": "stdio",
+      "disabled": false
+    },
+    "bedrock-agentcore-mcp-server": {
+      "command": "uv",
+      "args": ["tool", "run", "--from", "awslabs.amazon-bedrock-agentcore-mcp-server@latest", "awslabs.amazon-bedrock-agentcore-mcp-server.exe"],
+      "env": {"FASTMCP_LOG_LEVEL": "ERROR", "AWS_REGION": "af-south-1"},
+      "timeout": 120,
+      "type": "stdio",
+      "disabled": false
+    },
+    "awslabs.billing-cost-management-mcp-server": {
+      "command": "uvx",
+      "args": ["--from", "awslabs.billing-cost-management-mcp-server@latest", "awslabs.billing-cost-management-mcp-server.exe"],
+      "env": {"FASTMCP_LOG_LEVEL": "ERROR", "AWS_REGION": "af-south-1"},
+      "timeout": 60,
+      "type": "stdio",
+      "disabled": false
+    }
+  }
+}

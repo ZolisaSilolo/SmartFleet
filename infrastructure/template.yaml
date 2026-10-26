@@ -1,0 +1,2023 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: 'SmartFleet - multi-tenant serverless fleet operations platform
+  (af-south-1). Same-origin delivery through CloudFront (SPA + /api),
+  Cognito-authenticated HTTP API, DynamoDB tenant-partitioned data, DynamoDB
+  Streams CDC, Bedrock-backed AI. Production hardening per the Well-Architected
+  review: see docs/RUNBOOKS.md.'
+Metadata:
+  AWSToolsMetrics:
+    AWSAgentToolkit: aws-cloudformation@3
+
+Parameters:
+  Stage:
+    Type: String
+    Default: staging
+    AllowedValues:
+      - dev
+      - staging
+      - prod
+  AlertEmail:
+    Type: String
+    Description: Operations mailbox that receives alarm notifications (confirm the
+      SNS subscription email).
+    AllowedPattern: ^[^@\s]+@[^@\s]+\.[^@\s]+$
+  BedrockModelId:
+    Type: String
+    Description: Bedrock global inference profile id. af-south-1 serves models only through
+      (global) inference profiles. Default is Moonshot Kimi K3 - available in this account with no
+      model-access form required (unlike Anthropic models, which need the use-case form).
+    Default: global.moonshotai.kimi-k3
+  BedrockFoundationModelId:
+    Type: String
+    Description: Foundation model id underlying the inference profile (used to scope IAM).
+    Default: moonshotai.kimi-k3
+  BedrockSupportsTemperature:
+    Type: String
+    Default: 'false'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: Set false for reasoning models (e.g. Kimi) that reject the temperature field;
+      true for standard chat models (e.g. Anthropic, Nova).
+  AiEnabled:
+    Type: String
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: Operator kill switch for all AI endpoints.
+  AiRateLimitPerMinute:
+    Type: Number
+    Default: 10
+  AiRateLimitPerDay:
+    Type: Number
+    Default: 300
+  AnalyticsLookbackDays:
+    Type: Number
+    Default: 365
+    MinValue: 30
+    MaxValue: 1095
+  LogRetentionDays:
+    Type: Number
+    Default: 90
+    AllowedValues:
+      - 30
+      - 60
+      - 90
+      - 120
+      - 180
+      - 365
+  ApiThrottleRate:
+    Type: Number
+    Default: 50
+    Description: Steady-state requests per second allowed on the HTTP API.
+  ApiThrottleBurst:
+    Type: Number
+    Default: 100
+  ConcurrencyAlarmThreshold:
+    Type: Number
+    Default: 8
+    Description: Alarm when account-wide Lambda concurrency approaches the regional
+      quota (new accounts start at 10).
+  WebAclArn:
+    Type: String
+    Default: ''
+    Description: ARN of the CLOUDFRONT-scope WAF web ACL from
+      infrastructure/waf-cloudfront.yaml (us-east-1). Required for prod.
+  DomainName:
+    Type: String
+    Default: ''
+    Description: Optional custom domain (e.g. app.example.co.za). Requires CertificateArn.
+  CertificateArn:
+    Type: String
+    Default: ''
+    Description: ACM certificate ARN in us-east-1 for DomainName.
+
+Conditions:
+  IsProd: !Equals
+    - !Ref Stage
+    - prod
+  IsDev: !Equals
+    - !Ref Stage
+    - dev
+  EnableBackup: !Not
+    - !Condition IsDev
+  HasWaf: !Not
+    - !Equals
+      - !Ref WebAclArn
+      - ''
+  HasDomain: !And
+    - !Not
+      - !Equals
+        - !Ref DomainName
+        - ''
+    - !Not
+      - !Equals
+        - !Ref CertificateArn
+        - ''
+
+Globals:
+  Function:
+    Runtime: python3.13
+    Architectures:
+      - arm64
+    Timeout: 10
+    MemorySize: 512
+    Tracing: Active
+    AutoPublishAlias: live
+    DeploymentPreference:
+      Type: !If
+        - IsProd
+        - Canary10Percent5Minutes
+        - AllAtOnce
+      Alarms:
+        - !Ref LambdaErrorsAlarm
+    Layers:
+      - !Ref RuntimeDependenciesLayer
+    LoggingConfig:
+      LogFormat: JSON
+      LogGroup: !Ref AppLogGroup
+      ApplicationLogLevel: INFO
+      SystemLogLevel: WARN
+    Environment:
+      Variables:
+        STAGE: !Ref Stage
+        POWERTOOLS_SERVICE_NAME: smart-fleet
+        POWERTOOLS_METRICS_NAMESPACE: SmartFleet
+        VEHICLES_TABLE: !Ref VehiclesTable
+        DRIVERS_TABLE: !Ref DriversTable
+        TRIPS_TABLE: !Ref TripsTable
+        FUEL_TABLE: !Ref FuelTable
+        MAINTENANCE_TABLE: !Ref MaintenanceTable
+        STATIONS_TABLE: !Ref StationsTable
+        RATE_LIMIT_TABLE: !Ref RateLimitTable
+        EVENT_BUS_NAME: !Ref FleetEventBus
+        ANALYTICS_LOOKBACK_DAYS: !Ref AnalyticsLookbackDays
+
+Resources:
+  # ===========================================================================
+  # SHARED: encryption key, dependency layer, logs, alerting
+  # ===========================================================================
+  OpsKey:
+    Type: AWS::KMS::Key
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: Customer-managed key for operational data (alert topic, failure queue,
+          application logs).
+        must: Key policy must keep the CloudWatch Logs, CloudWatch and EventBridge
+          service statements or alarms and logging break.
+    Properties:
+      Description: !Sub SmartFleet operations key (${Stage})
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AccountAdministration
+            Effect: Allow
+            Principal:
+              AWS: !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:root
+            Action: kms:*
+            Resource: '*'
+          - Sid: CloudWatchLogsUse
+            Effect: Allow
+            Principal:
+              Service: !Sub logs.${AWS::Region}.amazonaws.com
+            Action:
+              - kms:Encrypt*
+              - kms:Decrypt*
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+              - kms:Describe*
+            Resource: '*'
+            Condition:
+              ArnLike:
+                kms:EncryptionContext:aws:logs:arn: !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:*
+          - Sid: AlarmsPublishToEncryptedTopic
+            Effect: Allow
+            Principal:
+              Service:
+                - cloudwatch.amazonaws.com
+                - events.amazonaws.com
+            Action:
+              - kms:Decrypt
+              - kms:GenerateDataKey*
+            Resource: '*'
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+
+  OpsKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub alias/smart-fleet-ops-${Stage}
+      TargetKeyId: !Ref OpsKey
+
+  RuntimeDependenciesLayer:
+    Type: AWS::Serverless::LayerVersion
+    Metadata:
+      BuildMethod: makefile
+      BuildArchitecture: arm64
+    Properties:
+      LayerName: !Sub ${AWS::StackName}-deps
+      Description: Pinned runtime dependencies built for Lambda arm64 / Python 3.13
+        (backend/layer/requirements.txt)
+      ContentUri: ../backend/layer/
+      CompatibleRuntimes:
+        - python3.13
+      CompatibleArchitectures:
+        - arm64
+      RetentionPolicy: Retain
+
+  AppLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      LogGroupName: !Sub /smartfleet/${Stage}/app
+      RetentionInDays: !Ref LogRetentionDays
+      KmsKeyId: !GetAtt OpsKey.Arn
+
+  ApiAccessLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      LogGroupName: !Sub /smartfleet/${Stage}/api-access
+      RetentionInDays: !Ref LogRetentionDays
+
+  AlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub smart-fleet-alerts-${Stage}
+      KmsMasterKeyId: !GetAtt OpsKey.Arn
+      Subscription:
+        - Protocol: email
+          Endpoint: !Ref AlertEmail
+
+  AlertTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics:
+        - !Ref AlertTopic
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowAccountAlarmsToPublish
+            Effect: Allow
+            Principal:
+              Service: cloudwatch.amazonaws.com
+            Action: sns:Publish
+            Resource: !Ref AlertTopic
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: sns:Publish
+            Resource: !Ref AlertTopic
+            Condition:
+              Bool:
+                aws:SecureTransport: false
+
+  # ===========================================================================
+  # IDENTITY (Cognito). Tenant assignment is ADMIN-ONLY and immutable (WA C2).
+  # ===========================================================================
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: User directory. custom:tenantId is the ONLY source of tenant identity for
+          the API.
+        must: Keep tenantId Mutable false, AllowAdminCreateUserOnly true and exclude
+          custom:tenantId from the app client WriteAttributes.
+    Properties:
+      UserPoolName: !Sub smart-fleet-users-${Stage}
+      DeletionProtection: ACTIVE
+      UsernameAttributes:
+        - email
+      AutoVerifiedAttributes:
+        - email
+      AdminCreateUserConfig:
+        AllowAdminCreateUserOnly: true
+      MfaConfiguration: 'ON'
+      EnabledMfas:
+        - SOFTWARE_TOKEN_MFA
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 12
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireSymbols: true
+          RequireUppercase: true
+          TemporaryPasswordValidityDays: 7
+      AccountRecoverySetting:
+        RecoveryMechanisms:
+          - Name: verified_email
+            Priority: 1
+      Schema:
+        - Name: tenantId
+          AttributeDataType: String
+          Mutable: false
+          Required: false
+          StringAttributeConstraints:
+            MinLength: '3'
+            MaxLength: '64'
+
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: !Sub smart-fleet-web-${Stage}
+      UserPoolId: !Ref UserPool
+      GenerateSecret: false
+      ExplicitAuthFlows:
+        - ALLOW_USER_SRP_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+      PreventUserExistenceErrors: ENABLED
+      EnableTokenRevocation: true
+      ReadAttributes:
+        - email
+        - email_verified
+        - custom:tenantId
+      WriteAttributes:
+        - email
+      AccessTokenValidity: 60
+      IdTokenValidity: 60
+      RefreshTokenValidity: 12
+      TokenValidityUnits:
+        AccessToken: minutes
+        IdToken: minutes
+        RefreshToken: hours
+
+  # ===========================================================================
+  # API (HTTP API payload v2, JWT authorizer, throttled, access-logged)
+  # ===========================================================================
+  FleetHttpApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      StageName: !Ref Stage
+      DefaultRouteSettings:
+        ThrottlingBurstLimit: !Ref ApiThrottleBurst
+        ThrottlingRateLimit: !Ref ApiThrottleRate
+        DetailedMetricsEnabled: true
+      AccessLogSettings:
+        DestinationArn: !GetAtt ApiAccessLogGroup.Arn
+        Format: '{"requestId":"$context.requestId","ip":"$context.identity.sourceIp","time":"$context.requestTime","method":"$context.httpMethod","route":"$context.routeKey","status":"$context.status","latencyMs":"$context.responseLatency","integrationError":"$context.integrationErrorMessage","authorizerError":"$context.authorizer.error"}'
+      Auth:
+        DefaultAuthorizer: CognitoJwtAuthorizer
+        Authorizers:
+          CognitoJwtAuthorizer:
+            IdentitySource: $request.header.Authorization
+            JwtConfiguration:
+              issuer: !Sub https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPool}
+              audience:
+                - !Ref UserPoolClient
+
+  # ===========================================================================
+  # DATA (DynamoDB, tenantId partition key everywhere; PITR; AWS-managed KMS; retained)
+  # ===========================================================================
+  VehiclesTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      DeletionProtectionEnabled: !If
+        - IsProd
+        - true
+        - false
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+      AttributeDefinitions:
+        - AttributeName: tenantId
+          AttributeType: S
+        - AttributeName: vehicleId
+          AttributeType: S
+        - AttributeName: plateNumber
+          AttributeType: S
+      KeySchema:
+        - AttributeName: tenantId
+          KeyType: HASH
+        - AttributeName: vehicleId
+          KeyType: RANGE
+      GlobalSecondaryIndexes:
+        - IndexName: plate-index
+          KeySchema:
+            - AttributeName: tenantId
+              KeyType: HASH
+            - AttributeName: plateNumber
+              KeyType: RANGE
+          Projection:
+            ProjectionType: KEYS_ONLY
+
+  DriversTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      DeletionProtectionEnabled: !If
+        - IsProd
+        - true
+        - false
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+      AttributeDefinitions:
+        - AttributeName: tenantId
+          AttributeType: S
+        - AttributeName: driverId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: tenantId
+          KeyType: HASH
+        - AttributeName: driverId
+          KeyType: RANGE
+
+  StationsTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      DeletionProtectionEnabled: !If
+        - IsProd
+        - true
+        - false
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+      AttributeDefinitions:
+        - AttributeName: tenantId
+          AttributeType: S
+        - AttributeName: stationId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: tenantId
+          KeyType: HASH
+        - AttributeName: stationId
+          KeyType: RANGE
+
+  TripsTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      DeletionProtectionEnabled: !If
+        - IsProd
+        - true
+        - false
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      AttributeDefinitions:
+        - AttributeName: tenantId
+          AttributeType: S
+        - AttributeName: tripId
+          AttributeType: S
+        - AttributeName: startTime
+          AttributeType: S
+      KeySchema:
+        - AttributeName: tenantId
+          KeyType: HASH
+        - AttributeName: tripId
+          KeyType: RANGE
+      GlobalSecondaryIndexes:
+        - IndexName: tenant-startTime-index
+          KeySchema:
+            - AttributeName: tenantId
+              KeyType: HASH
+            - AttributeName: startTime
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+
+  FuelTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      DeletionProtectionEnabled: !If
+        - IsProd
+        - true
+        - false
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      AttributeDefinitions:
+        - AttributeName: tenantId
+          AttributeType: S
+        - AttributeName: logId
+          AttributeType: S
+        - AttributeName: fillDate
+          AttributeType: S
+        - AttributeName: vehicleKey
+          AttributeType: S
+      KeySchema:
+        - AttributeName: tenantId
+          KeyType: HASH
+        - AttributeName: logId
+          KeyType: RANGE
+      GlobalSecondaryIndexes:
+        - IndexName: tenant-fillDate-index
+          KeySchema:
+            - AttributeName: tenantId
+              KeyType: HASH
+            - AttributeName: fillDate
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+        - IndexName: vehicle-fillDate-index
+          KeySchema:
+            - AttributeName: vehicleKey
+              KeyType: HASH
+            - AttributeName: fillDate
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+
+  MaintenanceTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      DeletionProtectionEnabled: !If
+        - IsProd
+        - true
+        - false
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+      AttributeDefinitions:
+        - AttributeName: tenantId
+          AttributeType: S
+        - AttributeName: recordId
+          AttributeType: S
+        - AttributeName: serviceDate
+          AttributeType: S
+      KeySchema:
+        - AttributeName: tenantId
+          KeyType: HASH
+        - AttributeName: recordId
+          KeyType: RANGE
+      GlobalSecondaryIndexes:
+        - IndexName: tenant-serviceDate-index
+          KeySchema:
+            - AttributeName: tenantId
+              KeyType: HASH
+            - AttributeName: serviceDate
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+
+  RateLimitTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+      TimeToLiveSpecification:
+        AttributeName: expiresAt
+        Enabled: true
+      AttributeDefinitions:
+        - AttributeName: rateKey
+          AttributeType: S
+      KeySchema:
+        - AttributeName: rateKey
+          KeyType: HASH
+
+  # ===========================================================================
+  # BACKUPS (daily, 35 days) - in addition to PITR; not for dev
+  # ===========================================================================
+  BackupVault:
+    Type: AWS::Backup::BackupVault
+    Condition: EnableBackup
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BackupVaultName: !Sub smart-fleet-vault-${Stage}
+
+  BackupRole:
+    Type: AWS::IAM::Role
+    Condition: EnableBackup
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: backup.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/service-role/AWSBackupServiceRolePolicyForBackup
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/service-role/AWSBackupServiceRolePolicyForRestores
+
+  BackupPlan:
+    Type: AWS::Backup::BackupPlan
+    Condition: EnableBackup
+    Properties:
+      BackupPlan:
+        BackupPlanName: !Sub smart-fleet-daily-${Stage}
+        BackupPlanRule:
+          - RuleName: daily-35d
+            TargetBackupVault: !Ref BackupVault
+            ScheduleExpression: cron(0 2 * * ? *)
+            StartWindowMinutes: 60
+            CompletionWindowMinutes: 360
+            Lifecycle:
+              DeleteAfterDays: 35
+
+  BackupSelection:
+    Type: AWS::Backup::BackupSelection
+    Condition: EnableBackup
+    Properties:
+      BackupPlanId: !Ref BackupPlan
+      BackupSelection:
+        SelectionName: fleet-data-tables
+        IamRoleArn: !GetAtt BackupRole.Arn
+        Resources:
+          - !GetAtt VehiclesTable.Arn
+          - !GetAtt DriversTable.Arn
+          - !GetAtt StationsTable.Arn
+          - !GetAtt TripsTable.Arn
+          - !GetAtt FuelTable.Arn
+          - !GetAtt MaintenanceTable.Arn
+
+  # ===========================================================================
+  # EVENT BACKBONE (CDC consumers publish; archive allows replay)
+  # ===========================================================================
+  FleetEventBus:
+    Type: AWS::Events::EventBus
+    Properties:
+      Name: !Sub smart-fleet-bus-${Stage}
+
+  FleetEventArchive:
+    Type: AWS::Events::Archive
+    Properties:
+      ArchiveName: !Sub smart-fleet-archive-${Stage}
+      SourceArn: !GetAtt FleetEventBus.Arn
+      RetentionDays: 30
+
+  EventDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      MessageRetentionPeriod: 1209600
+      KmsMasterKeyId: !GetAtt OpsKey.Arn
+      KmsDataKeyReusePeriodSeconds: 300
+
+  EventDLQPolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref EventDLQ
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: sqs:*
+            Resource: !GetAtt EventDLQ.Arn
+            Condition:
+              Bool:
+                aws:SecureTransport: false
+
+  # ===========================================================================
+  # SYNCHRONOUS API SERVICES (one Lambda per domain, least-privilege per table)
+  # ===========================================================================
+  VehiclesFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-vehicles
+      CodeUri: ../backend/src/
+      Handler: vehicles.app.lambda_handler
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref VehiclesTable
+      Events:
+        List:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref FleetHttpApi
+            Path: /vehicles
+            Method: GET
+        Create:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref FleetHttpApi
+            Path: /vehicles
+            Method: POST
+        Get:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref FleetHttpApi
+            Path: /vehicles/{id}
+            Method: GET
+        Update:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref FleetHttpApi
+            Path: /vehicles/{id}
+            Method: PUT
+        Delete:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref FleetHttpApi
+            Path: /vehicles/{id}
+            Method: DELETE
+
+  DriversFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-drivers
+      CodeUri: ../backend/src/
+      Handler: drivers.app.lambda_handler
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref DriversTable
+        - DynamoDBReadPolicy:
+            TableName: !Ref VehiclesTable
+      Events:
+        List:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref FleetHttpApi
+            Path: /drivers
+            Method: GET
+        Create:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref FleetHttpApi
+            Path: /drivers
+            Method: POST
+        Get:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref FleetHttpApi
+            Path: /drivers/{id}
+            Method: GET
+        Update:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref FleetHttpApi
+            Path: /drivers/{id}
+            Method: PUT
+        Delete:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref FleetHttpApi
+            Path: /drivers/{id}
+            Method: DELETE
+
+  StationsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-stations
+      CodeUri: ../backend/src/
+      Handler: stations.app.lambda_handler
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref StationsTable
+      Events:
+        List:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref FleetHttpApi
+            Path: /stations
+            Method: GET
+        Create:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref FleetHttpApi
+            Path: /stations
+            Method: POST
+        Update:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref FleetHttpApi
+            Path: /stations/{id}
+            Method: PUT
+        Delete:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref FleetHttpApi
+            Path: /stations/{id}
+            Method: DELETE
+
+  TripsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-trips
+      CodeUri: ../backend/src/
+      Handler: trips.app.lambda_handler
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TripsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref VehiclesTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref DriversTable
+      Events:
+        List:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref FleetHttpApi
+            Path: /trips
+            Method: GET
+        Create:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref FleetHttpApi
+            Path: /trips
+            Method: POST
+        Get:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref FleetHttpApi
+            Path: /trips/{id}
+            Method: GET
+        End:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref FleetHttpApi
+            Path: /trips/{id}/end
+            Method: POST
+        Cancel:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref FleetHttpApi
+            Path: /trips/{id}/cancel
+            Method: POST
+
+  FuelFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-fuel
+      CodeUri: ../backend/src/
+      Handler: fuel.app.lambda_handler
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref FuelTable
+        - DynamoDBReadPolicy:
+            TableName: !Ref VehiclesTable
+        - DynamoDBReadPolicy:
+            TableName: !Ref DriversTable
+      Events:
+        List:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref FleetHttpApi
+            Path: /fuel
+            Method: GET
+        Create:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref FleetHttpApi
+            Path: /fuel
+            Method: POST
+        Summary:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref FleetHttpApi
+            Path: /fuel/summary
+            Method: GET
+        Get:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref FleetHttpApi
+            Path: /fuel/{id}
+            Method: GET
+        Delete:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref FleetHttpApi
+            Path: /fuel/{id}
+            Method: DELETE
+
+  MaintenanceFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-maintenance
+      CodeUri: ../backend/src/
+      Handler: maintenance.app.lambda_handler
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref MaintenanceTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref VehiclesTable
+      Events:
+        List:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref FleetHttpApi
+            Path: /maintenance
+            Method: GET
+        Create:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref FleetHttpApi
+            Path: /maintenance
+            Method: POST
+        Due:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref FleetHttpApi
+            Path: /maintenance/due
+            Method: GET
+        Get:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref FleetHttpApi
+            Path: /maintenance/{id}
+            Method: GET
+        Update:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref FleetHttpApi
+            Path: /maintenance/{id}
+            Method: PUT
+        Delete:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref FleetHttpApi
+            Path: /maintenance/{id}
+            Method: DELETE
+
+  AnalyticsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-analytics
+      CodeUri: ../backend/src/
+      Handler: analytics.app.lambda_handler
+      Timeout: 25
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref VehiclesTable
+        - DynamoDBReadPolicy:
+            TableName: !Ref DriversTable
+        - DynamoDBReadPolicy:
+            TableName: !Ref TripsTable
+        - DynamoDBReadPolicy:
+            TableName: !Ref FuelTable
+        - DynamoDBReadPolicy:
+            TableName: !Ref MaintenanceTable
+        - DynamoDBReadPolicy:
+            TableName: !Ref StationsTable
+      Events:
+        Dashboard:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref FleetHttpApi
+            Path: /analytics/dashboard
+            Method: GET
+        Costs:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref FleetHttpApi
+            Path: /analytics/costs
+            Method: GET
+        Efficiency:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref FleetHttpApi
+            Path: /analytics/efficiency
+            Method: GET
+        Utilisation:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref FleetHttpApi
+            Path: /analytics/utilisation
+            Method: GET
+        Corridors:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref FleetHttpApi
+            Path: /analytics/corridors
+            Method: GET
+        PlanRoute:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref FleetHttpApi
+            Path: /analytics/plan-route
+            Method: POST
+        VerifyFuel:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref FleetHttpApi
+            Path: /analytics/verify-fuel-location
+            Method: POST
+
+  AiFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-ai
+      Description: Bedrock-backed insights and Strands agent. Isolated so its IAM and
+        timeouts do not widen other services.
+      CodeUri: ../backend/src/
+      Handler: ai.app.lambda_handler
+      Timeout: 28
+      MemorySize: 1024
+      Environment:
+        Variables:
+          BEDROCK_MODEL_ID: !Ref BedrockModelId
+          BEDROCK_SUPPORTS_TEMPERATURE: !Ref BedrockSupportsTemperature
+          AI_ENABLED: !Ref AiEnabled
+          AI_RATE_LIMIT_PER_MINUTE: !Ref AiRateLimitPerMinute
+          AI_RATE_LIMIT_PER_DAY: !Ref AiRateLimitPerDay
+          BEDROCK_READ_TIMEOUT_SECONDS: '20'
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref VehiclesTable
+        - DynamoDBReadPolicy:
+            TableName: !Ref DriversTable
+        - DynamoDBReadPolicy:
+            TableName: !Ref TripsTable
+        - DynamoDBReadPolicy:
+            TableName: !Ref FuelTable
+        - DynamoDBReadPolicy:
+            TableName: !Ref StationsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref MaintenanceTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref RateLimitTable
+        - Version: '2012-10-17'
+          Statement:
+            - Sid: InvokeScopedInferenceProfile
+              Effect: Allow
+              Action:
+                - bedrock:InvokeModel
+                - bedrock:InvokeModelWithResponseStream
+              Resource: !Sub arn:${AWS::Partition}:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/${BedrockModelId}
+              Condition:
+                StringEquals:
+                  aws:RequestedRegion: !Ref AWS::Region
+            - Sid: InvokeRegionalFoundationModelViaProfile
+              Effect: Allow
+              Action:
+                - bedrock:InvokeModel
+                - bedrock:InvokeModelWithResponseStream
+              Resource: !Sub arn:${AWS::Partition}:bedrock:${AWS::Region}::foundation-model/${BedrockFoundationModelId}
+              Condition:
+                StringEquals:
+                  aws:RequestedRegion: !Ref AWS::Region
+                  bedrock:InferenceProfileArn: !Sub arn:${AWS::Partition}:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/${BedrockModelId}
+            - Sid: InvokeGlobalFoundationModelViaProfile
+              Effect: Allow
+              Action:
+                - bedrock:InvokeModel
+                - bedrock:InvokeModelWithResponseStream
+              Resource: !Sub arn:${AWS::Partition}:bedrock:::foundation-model/${BedrockFoundationModelId}
+              Condition:
+                StringEquals:
+                  aws:RequestedRegion: unspecified
+                  bedrock:InferenceProfileArn: !Sub arn:${AWS::Partition}:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/${BedrockModelId}
+      Events:
+        Insights:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref FleetHttpApi
+            Path: /analytics/ai-insights
+            Method: POST
+        Chat:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref FleetHttpApi
+            Path: /agent/chat
+            Method: POST
+
+  # ===========================================================================
+  # CDC WORKER (Trips + Fuel streams). Failures -> retries -> bisect -> SQS on-failure destination (alarmed).
+  # ===========================================================================
+  FleetEventProcessorFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-processor
+      Description: Stream consumer - owns vehicle odometer and emits domain events.
+      CodeUri: ../backend/src/
+      Handler: events.processor.lambda_handler
+      Timeout: 30
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref VehiclesTable
+        - DynamoDBReadPolicy:
+            TableName: !Ref FuelTable
+        - DynamoDBReadPolicy:
+            TableName: !Ref StationsTable
+        - EventBridgePutEventsPolicy:
+            EventBusName: !Ref FleetEventBus
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt EventDLQ.QueueName
+        - Version: '2012-10-17'
+          Statement:
+            - Sid: EncryptFailureQueueMessages
+              Effect: Allow
+              Action:
+                - kms:GenerateDataKey
+                - kms:Decrypt
+              Resource: !GetAtt OpsKey.Arn
+      Events:
+        TripsStream:
+          Type: DynamoDB
+          Properties:
+            Stream: !GetAtt TripsTable.StreamArn
+            StartingPosition: LATEST
+            BatchSize: 25
+            MaximumBatchingWindowInSeconds: 1
+            MaximumRetryAttempts: 3
+            MaximumRecordAgeInSeconds: 86400
+            BisectBatchOnFunctionError: true
+            FunctionResponseTypes:
+              - ReportBatchItemFailures
+            DestinationConfig:
+              OnFailure:
+                Type: SQS
+                Destination: !GetAtt EventDLQ.Arn
+            FilterCriteria:
+              Filters:
+                - Pattern: '{"eventName":["MODIFY"],"dynamodb":{"NewImage":{"status":{"S":["COMPLETED"]}}}}'
+        FuelStream:
+          Type: DynamoDB
+          Properties:
+            Stream: !GetAtt FuelTable.StreamArn
+            StartingPosition: LATEST
+            BatchSize: 25
+            MaximumBatchingWindowInSeconds: 1
+            MaximumRetryAttempts: 3
+            MaximumRecordAgeInSeconds: 86400
+            BisectBatchOnFunctionError: true
+            FunctionResponseTypes:
+              - ReportBatchItemFailures
+            DestinationConfig:
+              OnFailure:
+                Type: SQS
+                Destination: !GetAtt EventDLQ.Arn
+            FilterCriteria:
+              Filters:
+                - Pattern: '{"eventName":["INSERT"]}'
+      Environment:
+        Variables:
+          FUEL_ANOMALY_THRESHOLD_PCT: '15'
+
+  # ===========================================================================
+  # FRONTEND HOSTING: private S3 + CloudFront (OAC), same-origin /api, WAF, security headers
+  # ===========================================================================
+  AccessLogsBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Metadata:
+      guard:
+        SuppressedRules:
+          - S3_BUCKET_DEFAULT_LOCK_ENABLED # Logs expire by lifecycle; WORM is not a requirement.
+          - S3_BUCKET_REPLICATION_ENABLED # Cross-Region replication is not permitted for this project (single Region).
+          - S3_BUCKET_LOGGING_ENABLED # This is the log sink; self-logging would recurse.
+          - S3_BUCKET_NO_PUBLIC_RW_ACL # ACLs are only enabled for CloudFront log delivery; Block Public Access is on.
+    Properties:
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerPreferred # CloudFront standard logging requires ACLs
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-access-logs
+            Status: Enabled
+            ExpirationInDays: 90
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 7
+
+  AccessLogsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref AccessLogsBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: s3:*
+            Resource:
+              - !GetAtt AccessLogsBucket.Arn
+              - !Sub ${AccessLogsBucket.Arn}/*
+            Condition:
+              Bool:
+                aws:SecureTransport: false
+
+  FrontendBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Metadata:
+      guard:
+        SuppressedRules:
+          - S3_BUCKET_DEFAULT_LOCK_ENABLED # Static assets are rebuilt and re-synced on every release; WORM would block deploys.
+          - S3_BUCKET_REPLICATION_ENABLED # Cross-Region replication is not permitted for this project (single Region).
+          - S3_BUCKET_NO_PUBLIC_RW_ACL # ACLs are disabled (BucketOwnerEnforced) and Block Public Access is on.
+    Properties:
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-old-asset-versions
+            Status: Enabled
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 30
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+      LoggingConfiguration:
+        DestinationBucketName: !Ref AccessLogsBucket
+        LogFilePrefix: s3-frontend/
+
+  CloudFrontOAC:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub smart-fleet-oac-${Stage}
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  SecurityHeadersPolicy:
+    Type: AWS::CloudFront::ResponseHeadersPolicy
+    Properties:
+      ResponseHeadersPolicyConfig:
+        Name: !Sub smart-fleet-security-headers-${Stage}
+        SecurityHeadersConfig:
+          StrictTransportSecurity:
+            AccessControlMaxAgeSec: 31536000
+            IncludeSubdomains: true
+            Override: true
+          ContentTypeOptions:
+            Override: true
+          FrameOptions:
+            FrameOption: DENY
+            Override: true
+          ReferrerPolicy:
+            ReferrerPolicy: strict-origin-when-cross-origin
+            Override: true
+          ContentSecurityPolicy:
+            Override: true
+            ContentSecurityPolicy: !Sub default-src 'self'; script-src 'self'; style-src
+              'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self';
+              connect-src 'self'
+              https://cognito-idp.${AWS::Region}.amazonaws.com; frame-ancestors
+              'none'; base-uri 'self'; form-action 'self'; object-src 'none'
+        CustomHeadersConfig:
+          Items:
+            - Header: Permissions-Policy
+              Value: geolocation=(self), camera=(), microphone=(), payment=()
+              Override: true
+
+  RoutingFunction:
+    Type: AWS::CloudFront::Function
+    Properties:
+      Name: !Sub smart-fleet-routing-${Stage}-${AWS::Region}
+      AutoPublish: true
+      FunctionConfig:
+        Comment: Strip /api prefix for the API origin; serve index.html for SPA routes
+          (does not mask API 403/404).
+        Runtime: cloudfront-js-2.0
+      FunctionCode: |
+        function handler(event) {
+          var request = event.request;
+          var uri = request.uri;
+          if (uri.indexOf('/api/') === 0) {
+            request.uri = uri.substring(4);
+            return request;
+          }
+          if (uri.indexOf('.') === -1) {
+            request.uri = '/index.html';
+          }
+          return request;
+        }
+
+  FrontendDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: !Sub SmartFleet web + API (${Stage})
+        DefaultRootObject: index.html
+        HttpVersion: http2and3
+        IPV6Enabled: true
+        PriceClass: PriceClass_200
+        WebACLId: !If
+          - HasWaf
+          - !Ref WebAclArn
+          - !Ref AWS::NoValue
+        Aliases: !If
+          - HasDomain
+          - - !Ref DomainName
+          - !Ref AWS::NoValue
+        ViewerCertificate: !If
+          - HasDomain
+          - AcmCertificateArn: !Ref CertificateArn
+            SslSupportMethod: sni-only
+            MinimumProtocolVersion: TLSv1.2_2021
+          - CloudFrontDefaultCertificate: true
+        Logging:
+          Bucket: !GetAtt AccessLogsBucket.DomainName
+          Prefix: cloudfront/
+          IncludeCookies: false
+        Origins:
+          - Id: WebOrigin
+            DomainName: !GetAtt FrontendBucket.RegionalDomainName
+            OriginAccessControlId: !GetAtt CloudFrontOAC.Id
+            S3OriginConfig:
+              OriginAccessIdentity: ''
+          - Id: ApiOrigin
+            DomainName: !Sub ${FleetHttpApi}.execute-api.${AWS::Region}.amazonaws.com
+            OriginPath: !Sub /${Stage}
+            CustomOriginConfig:
+              OriginProtocolPolicy: https-only
+              OriginSSLProtocols:
+                - TLSv1.2
+              OriginReadTimeout: 30
+        DefaultCacheBehavior:
+          TargetOriginId: WebOrigin
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods:
+            - GET
+            - HEAD
+            - OPTIONS
+          CachedMethods:
+            - GET
+            - HEAD
+          Compress: true
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6 # Managed-CachingOptimized
+          ResponseHeadersPolicyId: !Ref SecurityHeadersPolicy
+          FunctionAssociations:
+            - EventType: viewer-request
+              FunctionARN: !GetAtt RoutingFunction.FunctionARN
+        CacheBehaviors:
+          - PathPattern: /api/*
+            TargetOriginId: ApiOrigin
+            ViewerProtocolPolicy: https-only
+            AllowedMethods:
+              - GET
+              - HEAD
+              - OPTIONS
+              - PUT
+              - PATCH
+              - POST
+              - DELETE
+            CachedMethods:
+              - GET
+              - HEAD
+            Compress: true
+            CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad # Managed-CachingDisabled
+            OriginRequestPolicyId: b689b0a8-53d0-40ab-baf2-68738e2966ac # Managed-AllViewerExceptHostHeader
+            ResponseHeadersPolicyId: !Ref SecurityHeadersPolicy
+            FunctionAssociations:
+              - EventType: viewer-request
+                FunctionARN: !GetAtt RoutingFunction.FunctionARN
+
+  FrontendBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref FrontendBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowCloudFrontOacRead
+            Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub ${FrontendBucket.Arn}/*
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${FrontendDistribution}
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: s3:*
+            Resource:
+              - !GetAtt FrontendBucket.Arn
+              - !Sub ${FrontendBucket.Arn}/*
+            Condition:
+              Bool:
+                aws:SecureTransport: false
+
+  # ===========================================================================
+  # ALARMS (all notify AlertTopic). Lambda alarms use explicit names to avoid a function<->alarm cycle.
+  # ===========================================================================
+  LambdaErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub smart-fleet-${Stage}-lambda-errors
+      AlarmDescription: Any Lambda error in the stack. Also gates canary deployments
+        (CodeDeploy rolls back on ALARM).
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Threshold: 1
+      EvaluationPeriods: 1
+      DatapointsToAlarm: 1
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertTopic
+      OKActions:
+        - !Ref AlertTopic
+      Metrics:
+        - Id: total
+          Expression: SUM(METRICS())
+          Label: TotalErrors
+          ReturnData: true
+        - Id: e1
+          ReturnData: false
+          MetricStat:
+            Stat: Sum
+            Period: 60
+            Metric:
+              Namespace: AWS/Lambda
+              MetricName: Errors
+              Dimensions:
+                - Name: FunctionName
+                  Value: !Sub ${AWS::StackName}-vehicles
+        - Id: e2
+          ReturnData: false
+          MetricStat:
+            Stat: Sum
+            Period: 60
+            Metric:
+              Namespace: AWS/Lambda
+              MetricName: Errors
+              Dimensions:
+                - Name: FunctionName
+                  Value: !Sub ${AWS::StackName}-drivers
+        - Id: e3
+          ReturnData: false
+          MetricStat:
+            Stat: Sum
+            Period: 60
+            Metric:
+              Namespace: AWS/Lambda
+              MetricName: Errors
+              Dimensions:
+                - Name: FunctionName
+                  Value: !Sub ${AWS::StackName}-stations
+        - Id: e4
+          ReturnData: false
+          MetricStat:
+            Stat: Sum
+            Period: 60
+            Metric:
+              Namespace: AWS/Lambda
+              MetricName: Errors
+              Dimensions:
+                - Name: FunctionName
+                  Value: !Sub ${AWS::StackName}-trips
+        - Id: e5
+          ReturnData: false
+          MetricStat:
+            Stat: Sum
+            Period: 60
+            Metric:
+              Namespace: AWS/Lambda
+              MetricName: Errors
+              Dimensions:
+                - Name: FunctionName
+                  Value: !Sub ${AWS::StackName}-fuel
+        - Id: e6
+          ReturnData: false
+          MetricStat:
+            Stat: Sum
+            Period: 60
+            Metric:
+              Namespace: AWS/Lambda
+              MetricName: Errors
+              Dimensions:
+                - Name: FunctionName
+                  Value: !Sub ${AWS::StackName}-maintenance
+        - Id: e7
+          ReturnData: false
+          MetricStat:
+            Stat: Sum
+            Period: 60
+            Metric:
+              Namespace: AWS/Lambda
+              MetricName: Errors
+              Dimensions:
+                - Name: FunctionName
+                  Value: !Sub ${AWS::StackName}-analytics
+        - Id: e8
+          ReturnData: false
+          MetricStat:
+            Stat: Sum
+            Period: 60
+            Metric:
+              Namespace: AWS/Lambda
+              MetricName: Errors
+              Dimensions:
+                - Name: FunctionName
+                  Value: !Sub ${AWS::StackName}-ai
+        - Id: e9
+          ReturnData: false
+          MetricStat:
+            Stat: Sum
+            Period: 60
+            Metric:
+              Namespace: AWS/Lambda
+              MetricName: Errors
+              Dimensions:
+                - Name: FunctionName
+                  Value: !Sub ${AWS::StackName}-processor
+
+  LambdaThrottlesAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub smart-fleet-${Stage}-lambda-throttles
+      AlarmDescription: Lambda invocations were throttled (concurrency quota reached).
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Threshold: 1
+      EvaluationPeriods: 1
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertTopic
+      OKActions:
+        - !Ref AlertTopic
+      Metrics:
+        - Id: total
+          Expression: SUM(METRICS())
+          Label: TotalThrottles
+          ReturnData: true
+        - Id: t1
+          ReturnData: false
+          MetricStat:
+            Stat: Sum
+            Period: 300
+            Metric:
+              Namespace: AWS/Lambda
+              MetricName: Throttles
+              Dimensions:
+                - Name: FunctionName
+                  Value: !Sub ${AWS::StackName}-vehicles
+        - Id: t2
+          ReturnData: false
+          MetricStat:
+            Stat: Sum
+            Period: 300
+            Metric:
+              Namespace: AWS/Lambda
+              MetricName: Throttles
+              Dimensions:
+                - Name: FunctionName
+                  Value: !Sub ${AWS::StackName}-drivers
+        - Id: t3
+          ReturnData: false
+          MetricStat:
+            Stat: Sum
+            Period: 300
+            Metric:
+              Namespace: AWS/Lambda
+              MetricName: Throttles
+              Dimensions:
+                - Name: FunctionName
+                  Value: !Sub ${AWS::StackName}-stations
+        - Id: t4
+          ReturnData: false
+          MetricStat:
+            Stat: Sum
+            Period: 300
+            Metric:
+              Namespace: AWS/Lambda
+              MetricName: Throttles
+              Dimensions:
+                - Name: FunctionName
+                  Value: !Sub ${AWS::StackName}-trips
+        - Id: t5
+          ReturnData: false
+          MetricStat:
+            Stat: Sum
+            Period: 300
+            Metric:
+              Namespace: AWS/Lambda
+              MetricName: Throttles
+              Dimensions:
+                - Name: FunctionName
+                  Value: !Sub ${AWS::StackName}-fuel
+        - Id: t6
+          ReturnData: false
+          MetricStat:
+            Stat: Sum
+            Period: 300
+            Metric:
+              Namespace: AWS/Lambda
+              MetricName: Throttles
+              Dimensions:
+                - Name: FunctionName
+                  Value: !Sub ${AWS::StackName}-maintenance
+        - Id: t7
+          ReturnData: false
+          MetricStat:
+            Stat: Sum
+            Period: 300
+            Metric:
+              Namespace: AWS/Lambda
+              MetricName: Throttles
+              Dimensions:
+                - Name: FunctionName
+                  Value: !Sub ${AWS::StackName}-analytics
+        - Id: t8
+          ReturnData: false
+          MetricStat:
+            Stat: Sum
+            Period: 300
+            Metric:
+              Namespace: AWS/Lambda
+              MetricName: Throttles
+              Dimensions:
+                - Name: FunctionName
+                  Value: !Sub ${AWS::StackName}-ai
+        - Id: t9
+          ReturnData: false
+          MetricStat:
+            Stat: Sum
+            Period: 300
+            Metric:
+              Namespace: AWS/Lambda
+              MetricName: Throttles
+              Dimensions:
+                - Name: FunctionName
+                  Value: !Sub ${AWS::StackName}-processor
+
+  LambdaConcurrencyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub smart-fleet-${Stage}-lambda-concurrency
+      AlarmDescription: Account-wide Lambda concurrency is near the regional quota.
+        Request a Service Quotas increase.
+      Namespace: AWS/Lambda
+      MetricName: ConcurrentExecutions
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 3
+      DatapointsToAlarm: 2
+      Threshold: !Ref ConcurrencyAlarmThreshold
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertTopic
+
+  HttpApi5xxAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub smart-fleet-${Stage}-api-5xx
+      AlarmDescription: HTTP API returned server errors.
+      Namespace: AWS/ApiGateway
+      MetricName: 5xx
+      Dimensions:
+        - Name: ApiId
+          Value: !Ref FleetHttpApi
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 5
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertTopic
+      OKActions:
+        - !Ref AlertTopic
+
+  HttpApiLatencyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub smart-fleet-${Stage}-api-latency-p95
+      AlarmDescription: p95 API latency above 3 s for 3 consecutive periods.
+      Namespace: AWS/ApiGateway
+      MetricName: Latency
+      Dimensions:
+        - Name: ApiId
+          Value: !Ref FleetHttpApi
+      ExtendedStatistic: p95
+      Period: 300
+      EvaluationPeriods: 3
+      DatapointsToAlarm: 3
+      Threshold: 3000
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertTopic
+
+  DynamoWriteThrottleAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub smart-fleet-${Stage}-ddb-write-throttles
+      AlarmDescription: DynamoDB write throttling on a fleet table.
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Threshold: 1
+      EvaluationPeriods: 1
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertTopic
+      Metrics:
+        - Id: total
+          Expression: SUM(METRICS())
+          Label: WriteThrottles
+          ReturnData: true
+        - Id: w1
+          ReturnData: false
+          MetricStat:
+            Stat: Sum
+            Period: 300
+            Metric:
+              Namespace: AWS/DynamoDB
+              MetricName: WriteThrottleEvents
+              Dimensions:
+                - Name: TableName
+                  Value: !Ref VehiclesTable
+        - Id: w2
+          ReturnData: false
+          MetricStat:
+            Stat: Sum
+            Period: 300
+            Metric:
+              Namespace: AWS/DynamoDB
+              MetricName: WriteThrottleEvents
+              Dimensions:
+                - Name: TableName
+                  Value: !Ref DriversTable
+        - Id: w3
+          ReturnData: false
+          MetricStat:
+            Stat: Sum
+            Period: 300
+            Metric:
+              Namespace: AWS/DynamoDB
+              MetricName: WriteThrottleEvents
+              Dimensions:
+                - Name: TableName
+                  Value: !Ref TripsTable
+        - Id: w4
+          ReturnData: false
+          MetricStat:
+            Stat: Sum
+            Period: 300
+            Metric:
+              Namespace: AWS/DynamoDB
+              MetricName: WriteThrottleEvents
+              Dimensions:
+                - Name: TableName
+                  Value: !Ref FuelTable
+        - Id: w5
+          ReturnData: false
+          MetricStat:
+            Stat: Sum
+            Period: 300
+            Metric:
+              Namespace: AWS/DynamoDB
+              MetricName: WriteThrottleEvents
+              Dimensions:
+                - Name: TableName
+                  Value: !Ref MaintenanceTable
+        - Id: w6
+          ReturnData: false
+          MetricStat:
+            Stat: Sum
+            Period: 300
+            Metric:
+              Namespace: AWS/DynamoDB
+              MetricName: WriteThrottleEvents
+              Dimensions:
+                - Name: TableName
+                  Value: !Ref RateLimitTable
+
+  DynamoReadThrottleAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub smart-fleet-${Stage}-ddb-read-throttles
+      AlarmDescription: DynamoDB read throttling on a fleet table.
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Threshold: 1
+      EvaluationPeriods: 1
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertTopic
+      Metrics:
+        - Id: total
+          Expression: SUM(METRICS())
+          Label: ReadThrottles
+          ReturnData: true
+        - Id: r1
+          ReturnData: false
+          MetricStat:
+            Stat: Sum
+            Period: 300
+            Metric:
+              Namespace: AWS/DynamoDB
+              MetricName: ReadThrottleEvents
+              Dimensions:
+                - Name: TableName
+                  Value: !Ref VehiclesTable
+        - Id: r2
+          ReturnData: false
+          MetricStat:
+            Stat: Sum
+            Period: 300
+            Metric:
+              Namespace: AWS/DynamoDB
+              MetricName: ReadThrottleEvents
+              Dimensions:
+                - Name: TableName
+                  Value: !Ref DriversTable
+        - Id: r3
+          ReturnData: false
+          MetricStat:
+            Stat: Sum
+            Period: 300
+            Metric:
+              Namespace: AWS/DynamoDB
+              MetricName: ReadThrottleEvents
+              Dimensions:
+                - Name: TableName
+                  Value: !Ref TripsTable
+        - Id: r4
+          ReturnData: false
+          MetricStat:
+            Stat: Sum
+            Period: 300
+            Metric:
+              Namespace: AWS/DynamoDB
+              MetricName: ReadThrottleEvents
+              Dimensions:
+                - Name: TableName
+                  Value: !Ref FuelTable
+        - Id: r5
+          ReturnData: false
+          MetricStat:
+            Stat: Sum
+            Period: 300
+            Metric:
+              Namespace: AWS/DynamoDB
+              MetricName: ReadThrottleEvents
+              Dimensions:
+                - Name: TableName
+                  Value: !Ref MaintenanceTable
+
+  StreamIteratorAgeAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub smart-fleet-${Stage}-stream-iterator-age
+      AlarmDescription: The CDC worker is more than 5 minutes behind the DynamoDB streams.
+      Namespace: AWS/Lambda
+      MetricName: IteratorAge
+      Dimensions:
+        - Name: FunctionName
+          Value: !Sub ${AWS::StackName}-processor
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 5
+      DatapointsToAlarm: 3
+      Threshold: 300000
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertTopic
+
+  EventDLQAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub smart-fleet-${Stage}-failed-stream-records
+      AlarmDescription: Stream records exhausted retries and landed in the failure
+        queue - replay per docs/RUNBOOKS.md.
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt EventDLQ.QueueName
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertTopic
+      OKActions:
+        - !Ref AlertTopic
+
+  AiFailuresAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub smart-fleet-${Stage}-ai-failures
+      AlarmDescription: Repeated AI (Bedrock) failures.
+      Namespace: SmartFleet
+      MetricName: AiFailures
+      Dimensions:
+        - Name: service
+          Value: smart-fleet
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 5
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertTopic
+
+  UnhandledErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub smart-fleet-${Stage}-unhandled-errors
+      AlarmDescription: Application code raised an unhandled exception.
+      Namespace: SmartFleet
+      MetricName: UnhandledErrors
+      Dimensions:
+        - Name: service
+          Value: smart-fleet
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertTopic
+
+  OperationsDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub SmartFleet-${Stage}
+      DashboardBody: !Sub |
+        {"widgets":[
+          {"type":"metric","x":0,"y":0,"width":12,"height":6,"properties":{"title":"API requests / 4xx / 5xx","region":"${AWS::Region}","stat":"Sum","period":300,"metrics":[["AWS/ApiGateway","Count","ApiId","${FleetHttpApi}"],[".","4xx",".","."],[".","5xx",".","."]]}},
+          {"type":"metric","x":12,"y":0,"width":12,"height":6,"properties":{"title":"API latency p95 (ms)","region":"${AWS::Region}","stat":"p95","period":300,"metrics":[["AWS/ApiGateway","Latency","ApiId","${FleetHttpApi}"]]}},
+          {"type":"metric","x":0,"y":6,"width":12,"height":6,"properties":{"title":"Lambda errors by function","region":"${AWS::Region}","stat":"Sum","period":300,"metrics":[["AWS/Lambda","Errors","FunctionName","${AWS::StackName}-vehicles"],["...","${AWS::StackName}-trips"],["...","${AWS::StackName}-fuel"],["...","${AWS::StackName}-maintenance"],["...","${AWS::StackName}-analytics"],["...","${AWS::StackName}-ai"],["...","${AWS::StackName}-processor"]]}},
+          {"type":"metric","x":12,"y":6,"width":12,"height":6,"properties":{"title":"CDC lag (IteratorAge ms) and failed records","region":"${AWS::Region}","period":60,"metrics":[["AWS/Lambda","IteratorAge","FunctionName","${AWS::StackName}-processor",{"stat":"Maximum"}],["AWS/SQS","ApproximateNumberOfMessagesVisible","QueueName","${EventDLQ.QueueName}",{"stat":"Maximum","yAxis":"right"}]]}},
+          {"type":"metric","x":0,"y":12,"width":12,"height":6,"properties":{"title":"Business metrics","region":"${AWS::Region}","stat":"Sum","period":3600,"metrics":[["SmartFleet","TripsStarted","service","smart-fleet"],[".","TripsCompleted",".","."],[".","FuelAnomalies",".","."],[".","FuelOffGeofence",".","."],[".","AgentMaintenanceProposals",".","."]]}},
+          {"type":"metric","x":12,"y":12,"width":12,"height":6,"properties":{"title":"AI usage and failures","region":"${AWS::Region}","stat":"Sum","period":300,"metrics":[["SmartFleet","AiRequests","service","smart-fleet"],[".","AiFailures",".","."]]}}
+        ]}
+
+Outputs:
+  ApiUrl:
+    Description: Direct HTTP API URL (smoke tests / local dev proxy). Browsers use
+      the CloudFront /api path.
+    Value: !Sub https://${FleetHttpApi}.execute-api.${AWS::Region}.amazonaws.com/${Stage}
+  FrontendUrl:
+    Description: Public URL of the application (CloudFront)
+    Value: !Sub https://${FrontendDistribution.DomainName}
+  FrontendBucketName:
+    Value: !Ref FrontendBucket
+  DistributionId:
+    Value: !Ref FrontendDistribution
+  UserPoolId:
+    Value: !Ref UserPool
+  UserPoolClientId:
+    Value: !Ref UserPoolClient
+  EventBusName:
+    Value: !Ref FleetEventBus
+  AlertTopicArn:
+    Value: !Ref AlertTopic
+  FailedRecordsQueueUrl:
+    Value: !Ref EventDLQ

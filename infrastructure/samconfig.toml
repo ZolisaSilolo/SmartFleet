@@ -1,0 +1,56 @@
+version = 0.1
+
+# Region is fixed to the project Region. AlertEmail (and WebAclArn/DomainName/CertificateArn for prod) are passed on the
+# command line / by CI so they are never committed:
+#   sam deploy --config-env prod --parameter-overrides "Stage=prod AlertEmail=ops@example.co.za WebAclArn=arn:..."
+
+[default.global.parameters]
+stack_name = "smart-fleet-backend-staging"
+region = "af-south-1"
+
+[default.build.parameters]
+cached = true
+parallel = true
+
+[default.validate.parameters]
+lint = true
+
+[default.deploy.parameters]
+capabilities = "CAPABILITY_IAM"
+resolve_s3 = true
+region = "af-south-1"
+confirm_changeset = true
+fail_on_empty_changeset = false
+
+[dev.deploy.parameters]
+stack_name = "smart-fleet-backend-dev"
+s3_prefix = "smart-fleet-backend-dev"
+capabilities = "CAPABILITY_IAM"
+resolve_s3 = true
+region = "af-south-1"
+confirm_changeset = false
+fail_on_empty_changeset = false
+parameter_overrides = "Stage=dev"
+tags = "Application=SmartFleet Stage=dev CostCentre=smartfleet"
+
+[staging.deploy.parameters]
+stack_name = "smart-fleet-backend-staging"
+s3_prefix = "smart-fleet-backend-staging"
+capabilities = "CAPABILITY_IAM"
+resolve_s3 = true
+region = "af-south-1"
+confirm_changeset = false
+fail_on_empty_changeset = false
+parameter_overrides = "Stage=staging"
+tags = "Application=SmartFleet Stage=staging CostCentre=smartfleet"
+
+[prod.deploy.parameters]
+stack_name = "smart-fleet-backend-prod"
+s3_prefix = "smart-fleet-backend-prod"
+capabilities = "CAPABILITY_IAM"
+resolve_s3 = true
+region = "af-south-1"
+confirm_changeset = true
+fail_on_empty_changeset = false
+parameter_overrides = "Stage=prod"
+tags = "Application=SmartFleet Stage=prod CostCentre=smartfleet"

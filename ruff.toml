@@ -1,0 +1,11 @@
+line-length = 140
+target-version = "py312"
+extend-exclude = [".venv", "frontend", ".aws-sam"]
+
+[lint]
+select = ["E", "F", "W", "I", "B", "S", "UP"]
+ignore = ["S101", "B008", "UP006", "UP007", "UP035", "UP045", "E501"]
+
+[lint.per-file-ignores]
+"backend/tests/*" = ["S", "B"]
+"scripts/*" = ["S"]

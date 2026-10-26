@@ -1,0 +1,6 @@
+aws-lambda-powertools==3.37.0
+aws-xray-sdk==2.15.0
+pydantic==2.14.1
+strands-agents==1.62.0
+boto3==1.43.118
+mcp==1.30.0  # transitive via strands-agents; fixed release for CVE-2026-59951 (2.2.0 conflicts with strands-agents 1.62.0)
