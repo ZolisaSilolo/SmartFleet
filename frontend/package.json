@@ -11,8 +11,9 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
+    "@aws-amplify/auth": "6.21.2",
+    "@aws-amplify/core": "6.19.3",
     "@fontsource/inter": "5.2.5",
-    "amazon-cognito-identity-js": "6.3.22",
     "lucide-react": "0.475.0",
     "react": "18.3.1",
     "react-dom": "18.3.1",

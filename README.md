@@ -10,12 +10,16 @@ which AWS requires in `us-east-1`. The stack is scale-to-zero: no fixed compute,
 
 ![SmartFleet architecture](docs/architecture/smartfleet-architecture.png)
 
+> The business-context, request-lifecycle, CDC, AI-agent, security-isolation and CI/CD diagrams are in the
+> [diagram gallery](#architecture-diagrams) below. All are AWS-native and regenerated from one script.
+
 ---
 
 ## Table of contents
 
 - [What it does](#what-it-does)
 - [Architecture at a glance](#architecture-at-a-glance)
+- [Architecture diagrams](#architecture-diagrams)
 - [Design guarantees](#design-guarantees-each-enforced-by-tests)
 - [Technology stack](#technology-stack)
 - [Repository layout](#repository-layout)
@@ -59,8 +63,41 @@ ai Lambda ──▶ Amazon Bedrock  (Converse API / Strands agent) via a scoped 
 ```
 
 Two companion diagrams in [`docs/architecture/`](docs/architecture): the **CDC & reliability flow**
-(`smartfleet-cdc-flow.png`) and the **CI/CD pipeline** (`smartfleet-cicd.png`). All three are regenerated from
+(`smartfleet-cdc-flow.png`) and the **CI/CD pipeline** (`smartfleet-cicd.png`). All are regenerated from
 [`generate_diagrams.py`](docs/architecture/generate_diagrams.py) (`diagrams` library + Graphviz).
+
+---
+
+## Architecture diagrams
+
+A layered set of AWS-native diagrams, grouped by audience, all rendered from a single script
+([`docs/architecture/generate_diagrams.py`](docs/architecture/generate_diagrams.py)) using the
+[`diagrams`](https://diagrams.mingrammer.com/) library and Graphviz. Regenerate with:
+
+```powershell
+pip install diagrams                      # and install Graphviz (winget install Graphviz.Graphviz)
+python docs/architecture/generate_diagrams.py
+```
+
+**For non-technical, executive and compliance stakeholders**
+
+| Diagram | What it answers |
+|---|---|
+| [Business context](docs/architecture/smartfleet-context.png) | In plain language: who uses SmartFleet, what it tracks, where the data lives, and the pay-per-use cost model |
+| [Security & tenant isolation](docs/architecture/smartfleet-security.png) | How each business sees only its own data, how identity is verified, and how data is protected (the POPIA / zero-leakage story) |
+
+**For engineering and operations**
+
+| Diagram | What it shows |
+|---|---|
+| [System architecture](docs/architecture/smartfleet-architecture.png) | The full resource topology across the edge and `af-south-1` |
+| [Request lifecycle](docs/architecture/smartfleet-request-lifecycle.png) | A single authenticated API call, from WAF through the JWT authorizer to a tenant-scoped DynamoDB read |
+| [CDC & reliability flow](docs/architecture/smartfleet-cdc-flow.png) | The transactional write path and the stream-processing failure path (no silent drops) |
+| [AI assistant](docs/architecture/smartfleet-ai-agent.png) | The Bedrock / Strands agent data flow, per-request tenant binding, propose-only writes and rate-limit guardrails |
+| [CI/CD pipeline](docs/architecture/smartfleet-cicd.png) | `verify → staging → plan → approve → canary`, with OIDC roles and automatic rollback |
+
+Each diagram and its intended audience are described in
+[`docs/ARCHITECTURE.md` §11](docs/ARCHITECTURE.md#11-diagram-suite).
 
 ---
 
@@ -85,14 +122,13 @@ Two companion diagrams in [`docs/architecture/`](docs/architecture): the **CDC &
 |---|---|
 | **Compute** | AWS Lambda, arm64 (Graviton), Python 3.13, AWS Lambda Powertools (logging, metrics, tracing) |
 | **API** | API Gateway HTTP API (payload v2) with a Cognito JWT authorizer, throttling and access logs |
-| **Auth** | Amazon Cognito user pool — SRP sign-in, mandatory TOTP MFA, admin-created users, immutable tenant attribute |
-| **Data** | Amazon DynamoDB (on-demand, PITR, SSE-KMS); AWS Backup daily/35-day; a TTL rate-limit table |
+| **Auth** | Amazon Cognito user pool — SRP sign-in, mandatory TOTP MFA, admin-created users, immutable tenant attribute || **Data** | Amazon DynamoDB (on-demand, PITR, SSE-KMS); AWS Backup daily/35-day; a TTL rate-limit table |
 | **Events** | DynamoDB Streams → stream-processor Lambda → Amazon EventBridge bus (+ archive); SQS failure queue |
 | **AI** | Amazon Bedrock Converse API + Strands Agents SDK; default model **Moonshot Kimi K3** (`global.moonshotai.kimi-k3`) — no model-access form required |
 | **Edge / web** | Amazon CloudFront (OAC, response-headers policy, SPA routing function), private S3 bucket, AWS WAF (managed rules + per-IP rate limits) |
 | **Observability** | CloudWatch logs (KMS-encrypted, retained), EMF metrics, X-Ray, a dashboard, and alarms wired to an encrypted SNS topic |
 | **IaC** | AWS SAM; validated with `sam validate`, cfn-lint and cfn-guard |
-| **Frontend** | React 18, Vite, TypeScript, Tailwind CSS, `amazon-cognito-identity-js`; Vitest + Testing Library |
+| **Frontend** | React 18, Vite, TypeScript, Tailwind CSS; **AWS Amplify auth client** (`@aws-amplify/auth` + `@aws-amplify/core`, tokens in `sessionStorage`); Vitest + Testing Library |
 | **CI/CD** | GitHub Actions with OIDC (no long-lived keys), SHA-pinned actions, Dependabot, `pip-audit` + `npm audit` gates |
 
 ---
@@ -114,7 +150,7 @@ SmartFleet/
 │   ├── layer/                # hash-locked arm64 runtime deps (requirements.in → requirements.txt)
 │   └── tests/                # 83 tests; tables built from the SAM template so they match prod
 ├── frontend/
-│   └── src/                  # pages, components, auth (Cognito), services (http/api/auth/config), hooks, tests
+│   └── src/                  # pages, components, services (amplify/auth/http/api/config), hooks, tests (Amplify auth)
 ├── infrastructure/
 │   ├── template.yaml         # the SAM stack (API, auth, data, CDC, edge, alarms, dashboard, backups)
 │   ├── waf-cloudfront.yaml   # WAF web ACL (deploy to us-east-1 first)
@@ -128,7 +164,7 @@ SmartFleet/
 │   ├── ARCHITECTURE.md                    # full-stack design reference
 │   ├── RUNBOOKS.md                        # deploy, onboard, roll back, replay, restore, incident response
 │   ├── WELL_ARCHITECTED_REMEDIATION.md    # every review finding, its fix and the proving test
-│   └── architecture/                      # PNG diagrams + the script that builds them
+│   └── architecture/                      # 7 PNG diagrams + the script that builds them
 └── .github/workflows/deploy.yml           # CI/CD pipeline
 ```
 
@@ -201,7 +237,7 @@ against the exact keys and indexes production deploys — the schema can't drift
 | Suite | Count | Covers |
 |---|---|---|
 | Backend unit/integration | 83 | Every service, tenant isolation, transactions, CDC failure handling, AI error mapping, rate limiting, and an infrastructure regression guard (`test_template.py`) that locks in the security posture |
-| Frontend | 10 | HTTP client (ID token, no tenant header, honest errors, pagination), the login/MFA flow, and a guard test that fails if mock/demo/dev-identity code returns |
+| Frontend | 15 | HTTP client (ID token, no tenant header, honest errors, pagination), the login/MFA challenge flow (new-password → TOTP enrolment → TOTP), and a guard test that fails the build if mock/demo/dev-identity code or `localStorage` tokens return |
 
 ```powershell
 pytest --cov=backend/src --cov-fail-under=85     # currently ~95%

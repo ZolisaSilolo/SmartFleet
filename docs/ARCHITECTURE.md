@@ -5,10 +5,15 @@ capture, the AI agent, security, and observability. It complements the [README](
 the [runbooks](RUNBOOKS.md) (operations) and the [remediation record](WELL_ARCHITECTED_REMEDIATION.md).
 
 Diagrams live in [`architecture/`](architecture) and are regenerated from
-[`generate_diagrams.py`](architecture/generate_diagrams.py):
+[`generate_diagrams.py`](architecture/generate_diagrams.py). The full set and its intended audiences are described in
+[§11](#11-diagram-suite); in brief:
 
+- `smartfleet-context.png` — business context, plain language (non-technical)
 - `smartfleet-architecture.png` — the whole system
+- `smartfleet-request-lifecycle.png` — one authenticated request, edge to data
 - `smartfleet-cdc-flow.png` — the write path and the stream-failure path
+- `smartfleet-ai-agent.png` — the Bedrock / Strands agent flow and guardrails
+- `smartfleet-security.png` — identity, tenant isolation and data protection
 - `smartfleet-cicd.png` — the deploy pipeline
 
 ---
@@ -138,8 +143,9 @@ inference policy, scoped to exactly one profile + model.
 
 - **Cognito** user pool: SRP sign-in, **mandatory TOTP MFA**, admin-created users only (no self sign-up), 12-char
   password policy, token revocation. `custom:tenantId` is **immutable** and excluded from the app client's write
-  attributes, so a signed-in user cannot change their own tenant. The frontend uses `amazon-cognito-identity-js` with
-  tokens in `sessionStorage` (not `localStorage`).
+  attributes, so a signed-in user cannot change their own tenant. The frontend uses the **AWS Amplify auth client**
+  (`@aws-amplify/auth`), with the token provider pinned to `sessionStorage` (not Amplify's default `localStorage`), so a
+  stolen token dies with the tab. The app client is a public SPA client (no secret).
 - **Transport & edge:** HTTPS only; CloudFront response-headers policy sets HSTS, a strict CSP, `X-Frame-Options`,
   `X-Content-Type-Options`, `Referrer-Policy` and `Permissions-Policy`; buckets deny non-TLS via `aws:SecureTransport`.
 - **WAF** (us-east-1, CLOUDFRONT scope): AWS managed IP-reputation, common and known-bad-inputs rule sets, plus per-IP
@@ -163,12 +169,17 @@ traffic, Lambda errors, CDC lag, business metrics (trips, anomalies, proposals) 
 
 ## 8. Frontend
 
-React 18 + Vite + TypeScript + Tailwind. `services/auth.ts` wraps the Cognito SRP flow including the new-password and
+React 18 + Vite + TypeScript + Tailwind. `services/amplify.ts` configures the **AWS Amplify auth client** once at
+startup (public Cognito SPA client, token storage pinned to `sessionStorage` via a `KeyValueStorageInterface` adapter
+so tokens never touch `localStorage`). `services/auth.ts` wraps Amplify's `signIn` / `confirmSignIn` /
+`fetchAuthSession` / `signOut` behind a small, stable `SignInStep` union that drives the new-password and
 TOTP-enrolment challenges; `services/http.ts` attaches the ID token, enforces a request timeout, surfaces API errors
 with their stable code (no offline fallback), and `listAll` follows `nextToken` but refuses to silently truncate.
 `AuthContext` gates the app on a valid session and reacts to a `session-expired` event. A build-failing test
 (`no-mocks.test.ts`) ensures demo data, dev-identity headers, `localStorage` tokens and heuristic fallbacks never
-return. There is deliberately no mock backend — the dev server proxies `/api` to a deployed environment.
+return. There is deliberately no mock backend — the dev server proxies `/api` to a deployed environment. Only the
+auth-scoped Amplify packages are used (not the `aws-amplify` umbrella), which keeps the bundle lean and the production
+`npm audit` clean.
 
 ---
 
@@ -194,3 +205,40 @@ SHA-pinned; Dependabot keeps actions, npm and pip current.
 - **Not yet built.** No tenant-facing notifications (events are archived, not delivered); no per-user roles within a
   tenant (add Cognito groups if needed); the arm64 layer build and full pipeline haven't run end-to-end from a
   developer workstation (the first staging run is the real test).
+
+---
+
+## 11. Diagram suite
+
+All diagrams are rendered from a single source of truth,
+[`architecture/generate_diagrams.py`](architecture/generate_diagrams.py), using the
+[`diagrams`](https://diagrams.mingrammer.com/) library (AWS-native icon set) over Graphviz. They share one visual
+language so the set reads as a whole:
+
+- **Edge colours** — blue = client/request traffic; green = trusted in-Region data reads/writes; red = failure or
+  stream/reliability path; amber = AI / cross-border / caution; grey = control plane, telemetry and supporting flows.
+- **Cluster colours** — blue = the `af-south-1` Region boundary; amber = the global edge (CloudFront/WAF, us-east-1);
+  purple = identity/security; grey = operational groupings.
+
+Regenerate the whole set after any architecture change:
+
+```powershell
+pip install diagrams                       # Python library
+winget install Graphviz.Graphviz           # then add "C:\Program Files\Graphviz\bin" to PATH
+python docs/architecture/generate_diagrams.py
+```
+
+| File | Audience | Purpose |
+|---|---|---|
+| `smartfleet-context.png` | Non-technical, exec, prospective customers | Plain-language "what it is": who uses it, what it tracks (fleet + ZAR cash flow), the AI assistant that *suggests but never books*, per-tenant isolation, and the scale-to-zero cost model. No AWS jargon. |
+| `smartfleet-security.png` | Compliance, security reviewers, POPIA sign-off | The zero-leakage story: Shield/WAF at the edge, Cognito + Amplify verified identity, the JWT authorizer, the `tenantId` partition boundary (cross-tenant access returns 404, never data), and KMS/encrypted-logs data protection. |
+| `smartfleet-architecture.png` | Engineering, new joiners, reviewers | The complete resource topology: edge, identity, API, the eight domain Lambdas, seven DynamoDB tables + Backup, the CDC worker, Bedrock, KMS and observability. |
+| `smartfleet-request-lifecycle.png` | Engineering | One authenticated `GET /api/vehicles`, numbered 1→7: WAF → CloudFront Function → JWT authorizer → Lambda → `shared/auth` tenant extraction → Pydantic validation → tenant-scoped `TenantRepo` read. |
+| `smartfleet-cdc-flow.png` | Engineering, SRE | The single-transaction write path and the change-data-capture path, including retry → bisect → SQS on-failure destination → alarm, with monotonic idempotent odometer updates. |
+| `smartfleet-ai-agent.png` | Engineering, AI reviewers | The `ai` Lambda: the Strands agent's per-request tenant closure, the Converse tool-use loop with Bedrock, the five tenant-bound tools, propose-only writes, and the fail-closed rate limiter / kill switch. |
+| `smartfleet-cicd.png` | Engineering, release managers | The delivery pipeline: `verify → deploy staging → plan prod (change set) → manual approval → canary deploy with automatic rollback`, driven by three scoped GitHub OIDC roles. |
+
+These diagrams are intentionally **documentation, not generated from the deployed stack** — they express intent at a
+readable level of abstraction. The `test_template.py` infrastructure-regression test (not the diagrams) is what
+guarantees the *running* stack keeps its security posture; the diagrams are kept in step by hand when the architecture
+changes, which is why they live next to the code and regenerate from one script.
