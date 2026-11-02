@@ -16,19 +16,19 @@ attrs==26.1.0 \
     # via
     #   jsonschema
     #   referencing
-aws-lambda-powertools==3.37.0 \
-    --hash=sha256:92df3f790851a30cfb5ed45ff8e11f2de9b74e60aed0169d2a6b6da2362b45fb \
-    --hash=sha256:eec85df216ef5e99efd2cbed01ddeebe34585b650625dabc96fdc5b471ef8fcf
-    # via -r requirements.in
+aws-lambda-powertools==3.38.0 \
+    --hash=sha256:69eca8bd0634c4c8967a5503b282fe43d6da73075403bdb7c4334aa0c83a5575 \
+    --hash=sha256:aa3e6f07794fe118290bc26c831be0cb04393508899a9d8a3b2808ba80e0241a
+    # via -r layer/requirements.in
 aws-xray-sdk==2.15.0 \
     --hash=sha256:422d62ad7d52e373eebb90b642eb1bb24657afe03b22a8df4a8b2e5108e278a3 \
     --hash=sha256:794381b96e835314345068ae1dd3b9120bd8b4e21295066c37e8814dbb341365
-    # via -r requirements.in
+    # via -r layer/requirements.in
 boto3==1.43.118 \
     --hash=sha256:ab8f3d2c622ef039338b4f228d97ea55f1abd573d84bb9b9a5ee8cb6780c0ccd \
     --hash=sha256:c0620f799e0f0c222ba42c337b65cdbcd3da38a3121187f634d8926cbbb28a9c
     # via
-    #   -r requirements.in
+    #   -r layer/requirements.in
     #   strands-agents
 botocore==1.43.118 \
     --hash=sha256:7f3f9d88cc9e847587690f82a42e3c3c292c3026c92c1e60d68a9310018e003f \
@@ -262,7 +262,7 @@ mcp==1.30.0 \
     --hash=sha256:445414625fce5c295faa505bb11bacece661ab6f4028d57c935db57820b7a3e4 \
     --hash=sha256:666edb5009503e1047c9d60346a756f94b261f05cc2625f23d41c728ffc484d0
     # via
-    #   -r requirements.in
+    #   -r layer/requirements.in
     #   strands-agents
 opentelemetry-api==1.45.1 \
     --hash=sha256:aa38ed19bcc084ba42782a73255b3582283eced7ad6dddbd6695189e69adfb75 \
@@ -303,7 +303,7 @@ pydantic==2.14.1 \
     --hash=sha256:9195d967ec791692a04438115466764fb8b9a27b31f14a760437694f40d6b454 \
     --hash=sha256:94f478203dd03404682a1ada216965651dd74b1d2d5ffd62e00e0837caab5c26
     # via
-    #   -r requirements.in
+    #   -r layer/requirements.in
     #   mcp
     #   pydantic-settings
     #   strands-agents
@@ -450,7 +450,7 @@ pydantic-settings==2.16.1 \
     --hash=sha256:30f5313340da4e8f1b440d1910b92a5bc3ccbb6b4ba70ec2b8395bc921f418f5 \
     --hash=sha256:aff602a1886338c2df3d1e958e2193a8dc33cec75b91f202e83fd98484b4b0da
     # via mcp
-pyjwt==2.15.1 \
+pyjwt[crypto]==2.15.1 \
     --hash=sha256:42d59d631f7768a1028a64c7ff581a9bf7519804daf91fc5b6c56e30eec5e193 \
     --hash=sha256:4f259e80cdfb6b3fc18a7de51fd1ef9ec79652f25019bae68975ca2468a34df8
     # via mcp
@@ -700,7 +700,7 @@ starlette==1.10.0 \
 strands-agents==1.62.0 \
     --hash=sha256:331c94c61a5ddf2c4f06dfd877551bdd1d0bfee5ea89b76d6c546b65ea2104e1 \
     --hash=sha256:8732c87f9c1ceb6ef4c5c4bd6d96b4cdf1bbfde095f1537ec2ac6fddb8d5a066
-    # via -r requirements.in
+    # via -r layer/requirements.in
 typing-extensions==4.16.0 \
     --hash=sha256:481caa481374e813c1b176ada14e97f1f67a4539ce9cfeb3f350d78d6370c2e8 \
     --hash=sha256:dc983d19a509c94dba722ee6abd33940f7c05a89e243c47e907eb4db6f1a43e5

@@ -1,4 +1,4 @@
-aws-lambda-powertools==3.37.0
+aws-lambda-powertools==3.38.0
 aws-xray-sdk==2.15.0
 pydantic==2.14.1
 strands-agents==1.62.0
