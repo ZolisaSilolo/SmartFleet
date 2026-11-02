@@ -1,5 +1,5 @@
 -r layer/requirements.in
-pytest==9.1.1
+pytest==9.2.0
 pytest-cov==7.1.0
 moto[dynamodb,sqs,events]==5.2.4
 PyYAML==6.0.3
