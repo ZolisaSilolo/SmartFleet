@@ -450,7 +450,7 @@ pydantic-settings==2.16.1 \
     --hash=sha256:30f5313340da4e8f1b440d1910b92a5bc3ccbb6b4ba70ec2b8395bc921f418f5 \
     --hash=sha256:aff602a1886338c2df3d1e958e2193a8dc33cec75b91f202e83fd98484b4b0da
     # via mcp
-pyjwt==2.15.1 \
+pyjwt[crypto]==2.15.1 \
     --hash=sha256:42d59d631f7768a1028a64c7ff581a9bf7519804daf91fc5b6c56e30eec5e193 \
     --hash=sha256:4f259e80cdfb6b3fc18a7de51fd1ef9ec79652f25019bae68975ca2468a34df8
     # via mcp
@@ -697,15 +697,14 @@ starlette==1.10.0 \
     # via
     #   mcp
     #   sse-starlette
-strands-agents==1.62.0 \
-    --hash=sha256:331c94c61a5ddf2c4f06dfd877551bdd1d0bfee5ea89b76d6c546b65ea2104e1 \
-    --hash=sha256:8732c87f9c1ceb6ef4c5c4bd6d96b4cdf1bbfde095f1537ec2ac6fddb8d5a066
+strands-agents==1.64.0 \
+    --hash=sha256:e2b6af4e777c1c4c7b7eddc4b94bf61ea4a96702b9b44a4f3217b4faede31f25 \
+    --hash=sha256:e869bfae7237159fd6700b5cca88fa323c32939a4a1d01b9694caabd9b195473
     # via -r requirements.in
 typing-extensions==4.16.0 \
     --hash=sha256:481caa481374e813c1b176ada14e97f1f67a4539ce9cfeb3f350d78d6370c2e8 \
     --hash=sha256:dc983d19a509c94dba722ee6abd33940f7c05a89e243c47e907eb4db6f1a43e5
     # via
-    #   anyio
     #   aws-lambda-powertools
     #   mcp
     #   opentelemetry-api
